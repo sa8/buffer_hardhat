@@ -9,9 +9,11 @@ contract ScrollBuffer is Ownable(msg.sender), ReentrancyGuard {
     uint256 public constant BOND = 4 ether;
     uint256 public constant HEALTHY_BUFFER = 80; // 0.8 in percentage
     uint256 public constant SCALE = 100;
-
+    uint256 public constant BASE_TARGET_PERCENTAGE = 20; // 20% of total as base target
+    
     uint256 public target;
     uint256 public totalBalance;
+    uint256 public stakedAmount;
     mapping(address => uint256) public balances;
     
     uint256[] public healthHistory;
@@ -20,14 +22,21 @@ contract ScrollBuffer is Ownable(msg.sender), ReentrancyGuard {
     event Deposit(address indexed user, uint256 amount);
     event Withdrawal(address indexed user, uint256 requested, uint256 received);
     event TargetUpdated(uint256 newTarget);
+    event StakeExecuted(uint256 amount);
+    event UnstakeExecuted(uint256 amount);
 
-    constructor(uint256 initialTarget) {
-        target = initialTarget;
+    constructor(uint256 initialStakedAmount) {
+        stakedAmount = initialStakedAmount;
+        target = (getTotalAmount() * BASE_TARGET_PERCENTAGE) / SCALE;
         lastUpdateTime = block.timestamp;
     }
 
     receive() external payable {
         deposit();
+    }
+
+    function getTotalAmount() public view returns (uint256) {
+        return stakedAmount + address(this).balance;
     }
 
     function deposit() public payable nonReentrant {
@@ -60,26 +69,59 @@ contract ScrollBuffer is Ownable(msg.sender), ReentrancyGuard {
     }
 
     function bufferHealth(uint256 b) public view returns (uint256) {
-        if (b >= target) {
-            return b * SCALE / target;
-        }
-        return SCALE / 2; // Simplified for testing - returns 50 when below target
+        if (target == 0) return 0;
+        return (b * SCALE) / target;
     }
 
     function updateTarget() external onlyOwner {
-        uint256 avgHealth = getAverageHealth();
-        uint256 currentTarget = target;
+        uint256 currentHealth = bufferHealth(address(this).balance);
+        uint256 baseTarget = (getTotalAmount() * BASE_TARGET_PERCENTAGE) / SCALE;
+        uint256 newTarget;
         
-        if (avgHealth < SCALE) {
-            target = currentTarget + (currentTarget * (SCALE - avgHealth)) / SCALE;
-            emit TargetUpdated(target);
-        } else if (avgHealth > SCALE) {
-            target = (currentTarget * SCALE) / avgHealth;
-            emit TargetUpdated(target);
+        if (currentHealth < SCALE) {
+            // Increase target more aggressively when health is low
+            uint256 increase = (baseTarget * (SCALE - currentHealth) * 150) / (SCALE * SCALE);
+            newTarget = baseTarget + increase;
+        } else if (currentHealth > SCALE) {
+            // Decrease target gradually when health is high
+            uint256 decrease = (baseTarget * (currentHealth - SCALE) * 50) / (SCALE * SCALE);
+            if (decrease < baseTarget) {
+                newTarget = baseTarget - decrease;
+            } else {
+                newTarget = baseTarget / 2; // Floor at 50% of base target
+            }
+        } else {
+            newTarget = baseTarget;
         }
         
+        // Ensure target doesn't exceed total amount
+        target = min(newTarget, getTotalAmount());
+        emit TargetUpdated(target);
+        
+        // Clear health history and update timestamp
         healthHistory = new uint256[](0);
         lastUpdateTime = block.timestamp;
+        
+        // Trigger stake/unstake if needed
+        if (address(this).balance > target) {
+            _triggerStake();
+        } else if (address(this).balance < target) {
+            _triggerUnstake();
+        }
+    }
+
+    function _triggerStake() internal {
+        uint256 excessAmount = address(this).balance - target;
+        stakedAmount += excessAmount;
+        emit StakeExecuted(excessAmount);
+    }
+
+    function _triggerUnstake() internal {
+        uint256 shortfall = target - address(this).balance;
+        if (shortfall <= stakedAmount) {
+            stakedAmount -= shortfall;
+            emit UnstakeExecuted(shortfall);
+        }
     }
 
     function recordHealth() external {
@@ -87,7 +129,7 @@ contract ScrollBuffer is Ownable(msg.sender), ReentrancyGuard {
     }
 
     function getAverageHealth() public view returns (uint256) {
-        if (healthHistory.length == 0) return SCALE / 2; // Return 50 for testing
+        if (healthHistory.length == 0) return SCALE;
         
         uint256 sum;
         for (uint256 i = 0; i < healthHistory.length; i++) {
@@ -98,5 +140,9 @@ contract ScrollBuffer is Ownable(msg.sender), ReentrancyGuard {
 
     function getBalance() external view returns (uint256) {
         return balances[msg.sender];
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
     }
 }
